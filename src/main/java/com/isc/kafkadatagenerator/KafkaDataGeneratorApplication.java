@@ -1,0 +1,149 @@
+package com.isc.kafkadatagenerator;
+
+import java.util.Properties;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.kohsuke.args4j.CmdLineException;
+import org.kohsuke.args4j.CmdLineParser;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class KafkaDataGeneratorApplication {
+
+	private static final Logger logger = LogManager.getLogger(KafkaDataGeneratorApplication.class);
+	
+	public static void main(String[] args) {
+		SpringApplication.run(KafkaDataGeneratorApplication.class, args);
+
+		logger.info("Starting Kafka Data Generator");
+
+        CommandLineParams params = new CommandLineParams();
+        CmdLineParser parser = new CmdLineParser(params);
+
+        logger.info("Parsing CLI arguments");
+        try {
+            parser.parseArgument(args);
+        } catch (CmdLineException e) {
+            logger.error(e.getMessage());
+            parser.printUsage(System.err);
+            System.exit(2);
+        }
+
+        if (params.outputToEventhubs == params.outputToKafka) {
+            logger.error("Output to Kafka and Output to EventHubs can't be enabled/disabled at the same time");
+            System.exit(1);
+        }
+
+        //Set defaults for non required params. And log printout of value default or configured
+        if(params.workerThreadCount == null) { params.workerThreadCount = "4";}
+        if(params.eps == null) { params.eps = "0";}
+        if(params.eventFormat == null) { params.eventFormat = "json";}
+        if(params.messageSize == null) { params.messageSize = "256";}
+        if(params.messageCount == null) { params.messageSize = "10000";}
+
+        Properties props = new Properties();
+
+        if (Boolean.parseBoolean(params.outputToKafka) == true) {
+            // Check for required parameters
+            if (params.bootStrapServers == null || params.topic == null) {
+                logger.error("Missing required commandline parameter - quiting kafka-data-gen - Exit Status 1");
+                System.exit(1);
+            }
+
+            if(params.includeKafkaHeaders == null) { params.includeKafkaHeaders = "false";}
+            if(params.headerGenProfile == null) { params.headerGenProfile = "-1";}
+            props = parseKafkaArguments(params, props);
+
+        }
+        if (Boolean.parseBoolean(params.outputToEventhubs) ==  true) {
+            // Check for required parameters
+            if (params.eventHubName == null || params.eventHubNameSpace == null
+                    || params.eventHubSaskey == null  || params.eventHubSaskeyname == null) {
+                logger.error("Missing required commandline parameters for eventhub - quiting kafka-data-gen - Exit Status 1");
+                System.exit(1);
+            }
+            System.out.println("Configuring EventHubs Props");
+            props = parseEventHubsArguments(params, props);
+        }
+
+        logger.info(params);
+
+        //Create and configure Kafka Producer variables. Store in Properties object
+
+        EPSToken epsToken = new EPSToken();
+
+        /* Thread Implementation.
+        * RefreshTokenThread will be used to throttle and control message creation. If a token is not available at a
+        * given time a message cannot be created and sent. By using tokens we can control throughput. This thread will
+        * refresh tokens. Logic implemented in EPSToken().
+        * MetricsCalculatorThread is responsible for periodically reporting metrics to the log file.
+        * WorkThreads - create, batch and sent events to a Kafka topic.
+        * */
+        EPSThread thread_01 = new EPSThread("RefreshTokenThread", epsToken, props, params);
+        EPSThread thread_02 = new EPSThread("MetricsCalculatorThread", epsToken, props, params);
+        EPSThread[] epsThreadArray = new EPSThread[Integer.parseInt(params.workerThreadCount)];
+
+        long startTime = System.currentTimeMillis();
+
+        for(int i = 0; i < epsThreadArray.length; i++) {
+            String threadName = "WorkerThread-" + i;
+            epsThreadArray[i] = new EPSThread(threadName, epsToken, props, params);
+        }
+        try {
+            thread_01.thrd.join();
+            thread_02.thrd.join();
+            for(int i = 0; i < epsThreadArray.length; i++) {
+                epsThreadArray[i].thrd.join();
+            }
+        } catch (InterruptedException exc) {
+            logger.error("Thread Interrupted");
+        }
+
+        long elapsedTime = System.currentTimeMillis() - startTime;
+
+        // Program Exit statistics
+        logger.info(epsToken.getMessageKey() + " messages created and sent in " + (elapsedTime / 1000) + " seconds");
+        logger.info("Events Per Second of " + (long)(epsToken.getMessageKey())/(elapsedTime / 1000));
+        logger.info("Program run and complete without interruption");
+
+		//System.out.println("KafkaDataGeneratorApplication.main()");
+	}
+
+	public static Properties parseEventHubsArguments(CommandLineParams params, Properties props) {
+        try {
+            props.put("eventhub.name", params.eventHubName);
+            props.put("eventhub.namespace", params.eventHubNameSpace);
+            props.put("eventhub.saskeyname", params.eventHubSaskeyname);
+            props.put("eventhub.saskey", params.eventHubSaskey);
+        } catch (java.lang.NullPointerException e) {
+            logger.error(e.getMessage());
+            logger.error("Config Value Not provided");
+        }
+        return props;
+    }
+
+    public static Properties parseKafkaArguments(CommandLineParams params, Properties props) {
+        try {
+            props.put("bootstrap.servers", params.bootStrapServers);
+            if(params.acks != null) { props.put("acks", params.acks);}
+            else { props.put("acks", "all"); }
+            if(params.retries != null) { props.put("retries", params.retries); }
+            else {props.put("retries", "0"); }
+            if(params.kafkaBatchSize != null) { props.put("batch.size", params.kafkaBatchSize); }
+            else { props.put("batch.size", "1000");}
+            if(params.kafkaLingerms != null) { props.put("linger.ms", params.kafkaLingerms); }
+            else { props.put("linger.ms", "1"); }
+            if(params.kafkaBufferMemory != null) { props.put("buffer.memory", params.kafkaBufferMemory); }
+            else {props.put("buffer.memory", "16384"); }
+            props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+            props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+        } catch (java.lang.NullPointerException e) {
+            logger.error(e.getMessage());
+            logger.error("Config Value Not provided");
+        }
+        return props;
+    }
+
+}
